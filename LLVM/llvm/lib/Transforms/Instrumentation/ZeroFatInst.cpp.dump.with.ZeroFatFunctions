@@ -1,0 +1,1286 @@
+#include "llvm/Transforms/Instrumentation/ZeroFatInst.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/Type.h"
+#include "llvm/IR/Value.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/Instruction.h"
+#include "llvm/IR/DiagnosticInfo.h"
+#include "llvm/IR/DiagnosticPrinter.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/InitializePasses.h"
+#include "llvm/Pass.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Instrumentation.h"
+#include "llvm/IR/IntrinsicsARM.h"
+#include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/GlobalValue.h"
+//#include "llvm/IR/TypeBuilder.h"
+#include "llvm/IR/InlineAsm.h"
+#include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/Verifier.h"
+#include "llvm/Support/CommandLine.h"
+#include "llvm/Support/SpecialCaseList.h"
+#include "llvm/IR/LegacyPassManager.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Analysis/MemoryBuiltins.h"
+#include "llvm/Analysis/TargetLibraryInfo.h"
+#include "llvm/IR/MDBuilder.h"
+#include "llvm/Support/VirtualFileSystem.h"
+#include "llvm/IR/Intrinsics.h"
+#include "llvm/IR/IntrinsicsARM.h"
+
+#include <vector>
+#include <map>
+#include <iostream>
+#include <set>
+#include <string>
+
+#include <assert.h>
+#include <stdio.h>
+
+#define ZEROFAT_OOB_ERROR_READ               0
+#define ZEROFAT_OOB_ERROR_WRITE              1
+#define ZEROFAT_OOB_ERROR_MEMCPY             2
+#define ZEROFAT_OOB_ERROR_MEMSET             3
+#define ZEROFAT_OOB_ERROR_STRDUP             4
+#define ZEROFAT_OOB_ERROR_ESCAPE_CALL        5
+#define ZEROFAT_OOB_ERROR_ESCAPE_RETURN      6
+#define ZEROFAT_OOB_ERROR_ESCAPE_STORE       7
+#define ZEROFAT_OOB_ERROR_ESCAPE_PTR2INT     8
+#define ZEROFAT_OOB_ERROR_ESCAPE_INSERT      9
+#define ZEROFAT_OOB_ERROR_UNKNOWN            0xFF
+
+
+using namespace llvm;
+
+typedef std::vector<std::tuple<Instruction *, Value *, unsigned>> Plan;
+typedef std::map<Value *, Value *> PtrInfo;
+
+struct Bounds
+{
+    static const int32_t NONFAT_BOUND  = INT32_MAX;
+    static const int32_t UNKNOWN_BOUND = INT32_MIN;
+
+    static const int32_t lb = 0;
+    int32_t ub;
+
+    Bounds() : ub(0)
+    {
+
+    }
+
+    Bounds(size_t lb, size_t ub) : ub(ub)
+    {
+        errs() << "[Bounds] initialize bounds...\n";
+        if (lb != 0) {
+            errs() << "[Bounds] lb != 0, ub = UNKNOWN_BOUDNDS!!";
+            ub = UNKNOWN_BOUND;
+            errs() << "UNKNOWN_BOUND";
+        }
+    }
+
+    static Bounds empty()
+    {
+        errs() <<"[Bounds] empty()\n";
+        return Bounds();
+    }
+
+    static Bounds nonFat()
+    {
+        errs() <<"[Bounds] nonFat()\n";
+        return Bounds(0, NONFAT_BOUND);
+    }
+
+    static Bounds unknown()
+    {
+        errs() <<"[Bounds] unknown()\n";
+        return Bounds(0, UNKNOWN_BOUND);
+    }
+
+    bool isUnknown()
+    {
+        errs() <<"[Bounds] isUnknown()\n";
+        return (ub == UNKNOWN_BOUND);
+    }
+
+    bool isNonFat()
+    {
+        errs() <<"[Bounds] isNonFat()\n";
+        return (ub == NONFAT_BOUND);
+    }
+
+    bool isInBounds(int32_t k = 0)
+    {
+        errs() <<"[Bounds] isInBounds()\n";
+        errs() << "[Info] lb : " << lb << ", k: " << k << ", ub: " << ub << "\n";
+        return (k >= lb && k <= ub);
+    }
+
+    Bounds &operator-=(size_t k)
+    {
+        errs() << "[Bounds] operator-=()\n";
+        if (k == 0)
+            return *this;
+        if (isUnknown() || isNonFat())
+            return *this;
+        if (k > (size_t)ub)
+            ub = UNKNOWN_BOUND;
+        else
+            ub -= (int32_t)k;
+        return *this;
+    }
+
+    static Bounds min(Bounds bounds1, Bounds bounds2)
+    {
+        errs() << "[Bounds] min()\n";
+        return Bounds(0, std::min(bounds1.ub, bounds2.ub));
+    }
+};
+
+typedef std::map<Value *, Bounds> BoundsInfo;
+
+static Bounds getPtrBounds(const TargetLibraryInfo *TLI, const DataLayout *DL,
+    Value *Ptr, BoundsInfo &boundsInfo);
+static Value *calcBasePtr(const TargetLibraryInfo *TLI, Function *F,
+    Value *Ptr, PtrInfo &baseInfo);
+static void getInterestingInsts(const TargetLibraryInfo *TL,
+    const DataLayout *DL, BoundsInfo &boundsInfo, Instruction *I, Plan &plan);
+static void insertBoundsCheck(const DataLayout *DL, Instruction *I, Value *Ptr,
+    unsigned info, const PtrInfo &baseInfo);
+static bool isInterestingAlloca(Instruction *I);
+
+static cl::opt<bool> option_check_whole_access(
+    "zerofat-check-whole-access",
+    cl::desc("OOB-check the whole pointer access ptr..ptr+sizeof(*ptr) as "
+        "opposed to just ptr (increases the number and cost of checks)"));
+
+class ZeroFatWarning : public DiagnosticInfo
+{
+  private:
+    std::string msg;
+
+  public:
+    ZeroFatWarning(const char *msg) : DiagnosticInfo(777, DS_Warning),
+      msg(msg) { }
+    void print(DiagnosticPrinter &dp) const override;
+};
+
+void ZeroFatWarning::print(DiagnosticPrinter &dp) const
+{
+  dp << "[ZeroFat] Warning: " << msg << "\n";
+}
+
+static void addToPlan(const TargetLibraryInfo *TLI, const DataLayout *DL,
+    BoundsInfo &boundsInfo, Plan &plan, Instruction *I, Value *Ptr,
+    unsigned kind)
+{
+    //if (filterPtr(kind))
+    //    return;
+    Bounds bounds = getPtrBounds(TLI, DL, Ptr, boundsInfo);
+    size_t size = 0;
+    if (option_check_whole_access &&
+            (kind == ZEROFAT_OOB_ERROR_READ || kind == ZEROFAT_OOB_ERROR_WRITE))
+    {
+        Type *Ty = Ptr->getType();
+        if (auto *PtrTy = dyn_cast<PointerType>(Ty))
+        {
+            Ty = PtrTy->getPointerElementType();
+            size = DL->getTypeAllocSize(Ty);
+        }
+    }
+    // if (bounds.isInBounds(size)){
+    //     errs() << "isInBounds... stop adding to plan\n";
+    //     return;
+    // }
+    plan.push_back(std::make_tuple(I, Ptr, kind));
+    errs() << "Done adding to plan...\n";
+}
+
+static bool isUglyGEP(Value *Val)
+{
+    Instruction *I = dyn_cast<Instruction>(Val);
+    if (I == nullptr)
+        return false;
+    if (I->getMetadata("uglygep") != NULL)
+        return true;
+    else
+        return false;
+}
+
+static bool doesIntEscape(Value *Val, std::set<Value *> &seen)
+{
+    if (seen.find(Val) != seen.end())
+        return false;
+    seen.insert(Val);
+
+    // Sanity check:
+    if (Val->getType()->isVoidTy())
+    {
+        Val->dump();
+        Val->getContext().diagnose(ZeroFatWarning(
+            "(BUG) unknown integer escape"));
+        return true;
+    }
+
+    for (User *User: Val->users())
+    {
+        if (isa<ReturnInst>(User) ||
+                isa<CallInst>(User) ||
+                isa<InvokeInst>(User) ||
+                isa<StoreInst>(User) ||
+                isa<IntToPtrInst>(User))
+            return true;
+        if (isa<CmpInst>(User) ||
+                isa<BranchInst>(User) ||
+                isa<SwitchInst>(User))
+            continue;
+        if (doesIntEscape(User, seen))
+            return true;
+    }
+
+    return false;
+}
+
+static bool doesAllocaEscape(Value *Val, std::set<Value *> &seen)
+{
+    if (seen.find(Val) != seen.end())
+        return false;
+    seen.insert(Val);
+
+    // Sanity check:
+    if (Val->getType()->isVoidTy())
+    {
+        Val->dump();
+        Val->getContext().diagnose(ZeroFatWarning(
+            "(BUG) unknown alloca escape"));
+        return true;
+    }
+
+    for (User *User: Val->users())
+    {
+        if (isa<ReturnInst>(User))
+        {
+            // Return local variable = undefined; so does not count
+            continue;
+        }
+        if (isa<LoadInst>(User) || isa<CmpInst>(User))
+            continue;
+        if (StoreInst *Store = dyn_cast<StoreInst>(User))
+        {
+            if (Store->getPointerOperand() == Val)
+                continue;
+            return true;
+        }
+        if (isa<PtrToIntInst>(User))
+        {
+            std::set<Value *> seen;
+            if (doesIntEscape(User, seen))
+            {
+                return true;
+            }
+            continue;
+        }
+        if (CallInst *Call = dyn_cast<CallInst>(User))  // Includes OOB-check
+        {
+            Function *F = Call->getCalledFunction();
+            if (F != nullptr && F->doesNotAccessMemory())
+                continue;
+            return true;
+        }
+        if (InvokeInst *Invoke = dyn_cast<InvokeInst>(User))
+        {
+            Function *F = Invoke->getCalledFunction();
+            if (F != nullptr && F->doesNotAccessMemory())
+                continue;
+            return true;
+        }
+        if (isa<GetElementPtrInst>(User) ||
+            isa<BitCastInst>(User) ||
+            isa<SelectInst>(User) ||
+            isa<PHINode>(User))
+        {
+            if (doesAllocaEscape(User, seen))
+                return true;
+            continue;
+        }
+
+        // Sanity check:
+        User->dump();
+        User->getContext().diagnose(ZeroFatWarning(
+            "(BUG) unknown alloca user"));
+        return true;
+    }
+
+    return false;
+}
+
+static bool isMemoryAllocation(const TargetLibraryInfo *TLI, Value *Ptr)
+{
+    //if (option_no_replace_malloc)
+    //    return false;
+    Function *F = nullptr;
+    if (CallInst *Call = dyn_cast<CallInst>(Ptr))
+        F = Call->getCalledFunction();
+    else if (InvokeInst *Invoke = dyn_cast<InvokeInst>(Ptr))
+        F = Invoke->getCalledFunction();
+    else
+        return false;
+    if (F == nullptr)
+        return false;
+    if (!F->hasName())
+        return false;
+    const std::string &Name = F->getName().str();
+    // [TODO] Check if Memory Allocation Names are correct or not 
+    if (Name == "malloc" || Name == "realloc" || Name == "_Znwm" ||
+            Name == "_Znam" || Name == "_ZnwmRKSt9nothrow_t" ||
+            Name == "_ZnamRKSt9nothrow_t" || Name == "calloc" ||
+            Name == "valloc" || Name == "strdup" || Name == "strndup" ||
+            Name == "__wrap_malloc"
+            )
+        return true;
+    return false;
+}
+
+static bool isInterestingAlloca(Instruction *I)
+{
+    //if (option_no_replace_alloca)
+    //    return false;
+    AllocaInst *Alloca = dyn_cast<AllocaInst>(I);
+    if (Alloca == nullptr)
+        return false;
+    std::set<Value *> seen;
+    if (doesAllocaEscape(Alloca, seen))
+        return true;
+    return false;
+}
+
+static std::pair<BasicBlock *, BasicBlock::iterator> nextInsertPoint(Function *F,
+    Value *Ptr)
+{
+    if (InvokeInst *Invoke = dyn_cast<InvokeInst>(Ptr))
+    {
+        // This is a tricky case since we an invoke instruction is also a
+        // terminator.  Instead we create a new BasicBlock to insert into.
+        BasicBlock *fromBB = Invoke->getParent();
+        BasicBlock *toBB = Invoke->getNormalDest();
+        BasicBlock *newBB = SplitEdge(fromBB, toBB);
+        return std::make_pair(newBB, newBB->begin());
+    }
+    else if (isa<Argument>(Ptr) || isa<GlobalValue>(Ptr))
+    {
+        // For arguments or globals we insert into the entry basic block.
+        BasicBlock &Entry = F->getEntryBlock();
+        return std::make_pair(&Entry, Entry.begin());
+    }
+    else if (isa<Instruction>(Ptr) && !cast<Instruction>(Ptr)->isTerminator())
+    {
+        Instruction *I = dyn_cast<Instruction>(Ptr);
+        assert(I != nullptr);
+        BasicBlock::iterator i(I);
+        i++;
+        BasicBlock *BB = I->getParent();
+        return std::make_pair(BB, i);
+    }
+    else
+    {
+        Ptr->getContext().diagnose(ZeroFatWarning(
+            "(BUG) failed to calculate insert point"));
+        BasicBlock &Entry = F->getEntryBlock();
+        return std::make_pair(&Entry, Entry.begin());
+    }
+}
+
+static Bounds getInputPtrBounds(const DataLayout *DL, Value *Ptr)
+{
+    //if (!option_no_check_fields)
+    //    return Bounds::empty();
+    // Type *Ty = Ptr->getType();
+    // PointerType *PtrTy = dyn_cast<PointerType>(Ty);
+    // if (PtrTy == nullptr)
+    //     return Bounds::empty();
+    
+    // Ty = PtrTy->getPointerElementType();
+    // if (!Ty->isSized())
+    //     return Bounds::empty();
+    // size_t size = DL->getTypeAllocSize(Ty);
+    // return Bounds(0, size);
+    return Bounds::empty();
+}
+
+static Bounds getConstantPtrBounds(const TargetLibraryInfo *TLI,
+    const DataLayout *DL, Constant *C, BoundsInfo &boundsInfo)
+{
+    if (isa<ConstantPointerNull>(C))
+        return Bounds::nonFat();
+    else if (isa<UndefValue>(C))
+        return Bounds::nonFat();
+
+    auto i = boundsInfo.find(C);
+    if (i != boundsInfo.end())
+        return i->second;
+
+    Bounds bounds = Bounds::nonFat();
+    if (GlobalVariable *GV = dyn_cast<GlobalVariable>(C))
+    {
+        Type *Ty = GV->getType();
+        PointerType *PtrTy = dyn_cast<PointerType>(Ty);
+        assert(PtrTy != nullptr);
+        Ty = PtrTy->getPointerElementType();
+        size_t size = DL->getTypeAllocSize(Ty);
+        if (size != 0)
+        {
+            // (size==0) implies unspecified size, e.g. int x[];
+            bounds = Bounds(0, size);
+        }
+    }
+    if (ConstantExpr *CE = dyn_cast<ConstantExpr>(C))
+    {
+        switch (CE->getOpcode())
+        {
+            case Instruction::GetElementPtr:
+            {
+                GEPOperator *GEP = cast<GEPOperator>(CE);
+                assert(GEP != nullptr);
+                bounds = getPtrBounds(TLI, DL, GEP->getPointerOperand(),
+                    boundsInfo);
+                if (!bounds.isUnknown() && !bounds.isNonFat())
+                {
+                    APInt offset(32, 0);
+                    if (GEP->accumulateConstantOffset(*DL, offset) &&
+                            offset.isNonNegative())
+                        bounds -= offset.getZExtValue();
+                    else
+                        bounds = Bounds::unknown();
+                }
+                break;
+            }
+            case Instruction::BitCast:
+                bounds = getConstantPtrBounds(TLI, DL, CE->getOperand(0),
+                    boundsInfo);
+                break;
+            case Instruction::Select:
+            {
+                Bounds bounds1 = getConstantPtrBounds(TLI, DL,
+                    CE->getOperand(1), boundsInfo);
+                Bounds bounds2 = getConstantPtrBounds(TLI, DL,
+                    CE->getOperand(2), boundsInfo);
+                bounds = Bounds::min(bounds1, bounds2);
+                break;
+            }
+            case Instruction::IntToPtr:
+            case Instruction::ExtractElement:
+            case Instruction::ExtractValue:
+                // Assumed to be non-fat pointers:
+                bounds = Bounds::nonFat();
+                break;
+            default:
+            {
+                C->dump();
+                C->getContext().diagnose(ZeroFatWarning(
+                    "(BUG) unknown constant expression pointer type (size)"));
+                break;
+            }
+        }
+    }
+    // else if (isa<GlobalValue>(C))
+    // {
+    //      bounds = Bounds::nonFat();
+    // } 
+    else if (isa<GlobalValue>(C))
+    {
+        if (GlobalVariable *GV = dyn_cast<GlobalVariable>(C))
+        {
+        }
+        else {
+            bounds = Bounds::nonFat();
+        }
+    }
+    else
+    {
+        C->dump();
+        C->getContext().diagnose(ZeroFatWarning(
+            "(BUG) unknown constant pointer type (size)"));
+    }
+
+    boundsInfo.insert(std::make_pair(C, bounds));
+    return bounds;
+}
+
+static Bounds getPtrBounds(const TargetLibraryInfo *TLI, const DataLayout *DL,
+    Value *Ptr, BoundsInfo &boundsInfo)
+{
+    auto i = boundsInfo.find(Ptr);
+    if (i != boundsInfo.end())
+        return i->second;
+
+    Bounds bounds = Bounds::nonFat();
+    if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(Ptr))
+    {
+        bounds = getPtrBounds(TLI, DL, GEP->getPointerOperand(), boundsInfo);
+        if (!bounds.isUnknown() && !bounds.isNonFat())
+        {
+            APInt offset(32, 0);
+            if (GEP->accumulateConstantOffset(*DL, offset) &&
+                    offset.isNonNegative())
+            {
+                bounds -= offset.getZExtValue();
+                errs() << "[getPtrBounds] GEP...\n";
+            }
+            else
+            {
+                bounds = Bounds::unknown();
+                errs() << "[getPtrBounds] GEP (else) Bounds::unknown...\n";
+            }
+        }
+    }
+    else if (AllocaInst *Alloca = dyn_cast<AllocaInst>(Ptr))
+    {
+        errs() << "[getPtrBounds] Alloca -> nonFat()...\n";
+        bounds = Bounds::nonFat(); // Ignore about Stack Memory
+            
+    }
+    else if (BitCastInst *Cast = dyn_cast<BitCastInst>(Ptr))
+    {
+        errs() << "[getPtrBounds] BitCastInst...\n";
+        bounds = getPtrBounds(TLI, DL, Cast->getOperand(0), boundsInfo);
+    }
+    else if (SelectInst *Select = dyn_cast<SelectInst>(Ptr))
+    {
+        errs() << "[getPtrBounds] SelectInst...\n";
+        Bounds bounds1 = getPtrBounds(TLI, DL, Select->getOperand(1),
+            boundsInfo);
+        Bounds bounds2 = getPtrBounds(TLI, DL, Select->getOperand(2),
+            boundsInfo);
+        bounds = Bounds::min(bounds1, bounds2);
+        
+    }
+    else if (Constant *C = dyn_cast<Constant>(Ptr)) 
+    {
+        errs() << "[getPtrBounds] Constant...\n";
+        bounds = getConstantPtrBounds(TLI, DL, C, boundsInfo);
+    }
+    else if (isa<ConstantPointerNull>(Ptr) ||
+            //  isa<GlobalValue>(Ptr) ||           
+             isa<UndefValue>(Ptr))                  // Treat as non-fat
+    {
+        errs() << "[getPtrBounds] Treat as non-fat Bounds::nonFat()...\n";
+        bounds = Bounds::nonFat();
+    }
+    else if (isa<GlobalValue>(Ptr))
+    {
+        if (GlobalVariable *GV = dyn_cast<GlobalVariable>(C))
+        {
+        }
+        else {
+            bounds = Bounds::nonFat();
+        }
+    }
+    else if (isa<IntToPtrInst>(Ptr) ||
+                // isa<Argument>(Ptr) || // This part is directly related to stack memory (function arguments)
+                // isa<LoadInst>(Ptr) || // move to next else if statement
+                isa<ExtractValueInst>(Ptr) ||
+                isa<ExtractElementInst>(Ptr))
+    {
+        errs() << "[getPtrBounds] Input pointers...\n";
+        bounds = getInputPtrBounds(DL, Ptr);        // Input pointers
+    }
+    else if (isa<Argument>(Ptr))
+    {
+        errs() << "[getPtrBounds] Argument...\n";
+        
+        if (AllocaInst *allocaInst = dyn_cast<AllocaInst>(Ptr))
+        {
+            bounds = Bounds::nonFat();
+        }
+        else
+        {
+            bounds = getInputPtrBounds(DL, Ptr);
+        }
+    }
+    else if (isa<LoadInst>(Ptr))
+    {
+        errs() << "[getPtrBounds] LoadInst...\n";
+        
+        LoadInst *loadInst = dyn_cast<LoadInst>(Ptr);
+        Value *loadedValue = loadInst->getPointerOperand();
+        if (AllocaInst *allocaInst = dyn_cast<AllocaInst>(loadedValue))
+        {
+            // This is a load from a stack-allocated variable
+            bounds = Bounds::nonFat();
+        }
+        else
+        {
+            // This is a load from a non-stack-allocated variable
+            bounds = getInputPtrBounds(DL, Ptr);
+        }
+    }
+    else if (isa<CallInst>(Ptr) || isa<InvokeInst>(Ptr))
+    {
+        errs() << "[getPtrBounds] CallInst or InvokeInst...\n";
+        uint64_t size64;
+        uint32_t size;
+        if (isMemoryAllocation(TLI, Ptr) && getObjectSize(Ptr, size64, *DL, TLI))
+        {
+            errs() << "isMemoryAllocation && getObjectSize\n";
+            // bounds = Bounds(0, size64);
+            size = static_cast<uint32_t>(size64);
+            bounds = Bounds(0, size);
+        }
+        else
+            bounds = getInputPtrBounds(DL, Ptr);    // Input pointer (default).
+    }
+    else if (PHINode *PHI = dyn_cast<PHINode>(Ptr))
+    {
+        errs() << "[getPtrBounds] PHINode...\n";
+        size_t numValues = PHI->getNumIncomingValues();
+        bounds = Bounds::nonFat();
+        boundsInfo.insert(std::make_pair(Ptr, Bounds::unknown()));
+        for (size_t i = 0; i < numValues; i++)
+        {
+            Value *incomingValue = PHI->getIncomingValue(i);
+            if (AllocaInst *allocaInst = dyn_cast<AllocaInst>(incomingValue)) 
+            {
+                bounds = Bounds::nonFat();
+            }
+            else 
+            {
+                Bounds boundsIn = getPtrBounds(TLI, DL, PHI->getIncomingValue(i),
+                boundsInfo);
+                bounds = Bounds::min(bounds, boundsIn);
+            }
+            if (bounds.isUnknown())
+                break;      // No point continuing.
+        }
+        boundsInfo.erase(Ptr);
+    }
+    else
+    {
+        errs() << "[getPtrBounds] (BUG) unknown pointer type (size)...\n";
+        Ptr->dump();
+        Ptr->getContext().diagnose(ZeroFatWarning(
+                    "(BUG) unknown pointer type (size)"));
+    }
+
+    boundsInfo.insert(std::make_pair(Ptr, bounds));
+    return bounds;
+}
+
+static void getInterestingInsts(const TargetLibraryInfo *TLI,
+    const DataLayout *DL, BoundsInfo &boundsInfo, Instruction *I, Plan &plan)
+{
+    //if (I->getMetadata("nosanitize") != nullptr)
+    //    return;
+    Value *Ptr = nullptr;
+    unsigned kind = ZEROFAT_OOB_ERROR_UNKNOWN;
+    errs() << "[Step 1] Get Interesting Instructions !!\n";
+    if (StoreInst *Store = dyn_cast<StoreInst>(I))
+    {
+        errs() << "StoreInst...\n";
+        Value *Val = Store->getValueOperand();
+        if (Val->getType()->isPointerTy())
+            addToPlan(TLI, DL, boundsInfo, plan, I, Val,
+                ZEROFAT_OOB_ERROR_ESCAPE_STORE);
+        Ptr = Store->getPointerOperand();
+        kind = ZEROFAT_OOB_ERROR_WRITE;
+    }
+    else if (LoadInst *Load = dyn_cast<LoadInst>(I))
+    {
+        errs() << "LoadInst...\n";
+        Ptr = Load->getPointerOperand();
+        kind = ZEROFAT_OOB_ERROR_READ;
+    }
+    else if (MemTransferInst *MI = dyn_cast<MemTransferInst>(I))
+    {
+        //if (filterPtr(ZEROFAT_OOB_ERROR_MEMCPY))
+        //    return;
+        errs() << "MemTransferInst...\n";
+        IRBuilder<> builder(MI);
+        Value *Src = builder.CreateBitCast(MI->getOperand(1),
+            builder.getInt8PtrTy());
+        // Type *SrcType = Src->getType();
+        Type *SrcType = builder.getInt8Ty();
+        Value *SrcEnd = builder.CreateGEP(SrcType, Src, builder.CreateIntCast(MI->getOperand(2), builder.getInt32Ty(), false));
+        addToPlan(TLI, DL, boundsInfo, plan, I, SrcEnd,
+            ZEROFAT_OOB_ERROR_MEMCPY);
+        Value *Dst = builder.CreateBitCast(MI->getOperand(0),
+            builder.getInt8PtrTy());
+        // Type *DstType = Dst->getType();
+        Type *DstType = builder.getInt8Ty();
+        Value *DstEnd = builder.CreateGEP(DstType, Dst,
+            builder.CreateIntCast(MI->getOperand(2), builder.getInt32Ty(),
+                false));
+        addToPlan(TLI, DL, boundsInfo, plan, I, DstEnd,
+            ZEROFAT_OOB_ERROR_MEMCPY);
+        return;
+    }
+    else if (MemSetInst *MI = dyn_cast<MemSetInst>(I))
+    {
+        //if (filterPtr(ZEROFAT_OOB_ERROR_MEMSET))
+        //    return;
+        errs() << "MemSetInst...\n";
+        IRBuilder<> builder(MI);
+        Value *Dst = builder.CreateBitCast(MI->getOperand(0),
+            builder.getInt8PtrTy());
+        // Type *DstType = Dst->getType();
+        Type *DstType = builder.getInt8Ty();
+        Value *DstEnd = builder.CreateGEP(DstType, Dst,
+            builder.CreateIntCast(MI->getOperand(2), builder.getInt32Ty(),
+                false));
+        addToPlan(TLI, DL, boundsInfo, plan, I, DstEnd,
+            ZEROFAT_OOB_ERROR_MEMSET);
+        return;
+    }
+    // else if (PtrToIntInst *Ptr2Int = dyn_cast<PtrToIntInst>(I))
+    // {
+    //     errs() << "PtrToIntInst...\n";
+    //     std::set<Value *> seen;
+    //     if (!doesIntEscape(Ptr2Int, seen))
+    //         return;
+    //     Ptr = Ptr2Int->getPointerOperand();
+    //     if (isUglyGEP(Ptr))
+    //         return;
+    //     kind = ZEROFAT_OOB_ERROR_ESCAPE_PTR2INT;
+    // }
+    // else if (CallInst *Call = dyn_cast<CallInst>(I))
+    // {
+    //     errs() << "CallInst...\n";
+    //     Function *F = Call->getCalledFunction();
+    //     if (F != nullptr && F->doesNotAccessMemory())
+    //         return;
+    //     unsigned numArgs = Call->getNumOperands() - 1;
+    //     for (unsigned i = 0; i < numArgs; i++)
+    //     {
+    //         Value *Arg = Call->getArgOperand(i);
+    //         if (Arg->getType()->isPointerTy())
+    //             addToPlan(TLI, DL, boundsInfo, plan, I, Arg,
+    //                 ZEROFAT_OOB_ERROR_ESCAPE_CALL);
+    //     }
+    //     return;
+    // }
+    // else if (InvokeInst *Invoke = dyn_cast<InvokeInst>(I))
+    // {
+    //     errs() << "InvokeInst...\n";
+    //     Function *F = Invoke->getCalledFunction();
+    //     if (F != nullptr && F->doesNotAccessMemory())
+    //         return;
+    //     unsigned numArgs = Invoke->getNumOperands() - 1;
+    //     for (unsigned i = 0; i < numArgs; i++)
+    //     {
+    //         Value *Arg = Invoke->getArgOperand(i);
+    //         if (Arg->getType()->isPointerTy())
+    //             addToPlan(TLI, DL, boundsInfo, plan, I, Arg,
+    //                 ZEROFAT_OOB_ERROR_ESCAPE_CALL);
+    //     }
+    //     return;
+    // }
+    // else if (ReturnInst *Return = dyn_cast<ReturnInst>(I))
+    // {
+    //     errs() << "ReturnInst...\n";
+    //     Ptr = Return->getReturnValue();
+    //     if (Ptr == nullptr || !Ptr->getType()->isPointerTy())
+    //         return;
+    //     kind = ZEROFAT_OOB_ERROR_ESCAPE_RETURN;
+    // }
+    // else if (InsertValueInst *Insert = dyn_cast<InsertValueInst>(I))
+    // {
+    //     errs() << "InsertValueInst...\n";
+    //     Ptr = Insert->getInsertedValueOperand();
+    //     if (!Ptr->getType()->isPointerTy())
+    //         return;
+    //     kind = ZEROFAT_OOB_ERROR_ESCAPE_INSERT;
+    // }
+    // else if (InsertElementInst *Insert = dyn_cast<InsertElementInst>(I))
+    // {
+    //     errs() << "InsertElementInst...\n";
+    //     Ptr = Insert->getOperand(1);
+    //     if (!Ptr->getType()->isPointerTy())
+    //         return;
+    //     kind = ZEROFAT_OOB_ERROR_ESCAPE_INSERT;
+    // }
+    // else if (AtomicRMWInst *Atomic = dyn_cast<AtomicRMWInst>(I))
+    // {
+    //     errs() << "AtomicRMWInst...\n";
+    //     Ptr = Atomic->getPointerOperand();
+    //     kind = ZEROFAT_OOB_ERROR_WRITE;
+    // }
+    // else if (AtomicCmpXchgInst *Atomic = dyn_cast<AtomicCmpXchgInst>(I))
+    // {
+    //     errs() << "AtomicCmpXchgInst...\n";
+    //     Ptr = Atomic->getPointerOperand();
+    //     kind = ZEROFAT_OOB_ERROR_WRITE;
+    // }
+    else
+        return;
+
+    addToPlan(TLI, DL, boundsInfo, plan, I, Ptr, kind);
+    errs() << "addToPlan...\n";
+}
+
+// [TODO]: Crashed at getOrInsertFunction...
+// idk why there is transering null value...
+static Value *calcBasePtr(Function *F, Value *Ptr)
+{
+    auto i = nextInsertPoint(F, Ptr);
+    IRBuilder<> builder(i.first, i.second);
+    Module *M = F->getParent();
+    FunctionCallee G = M->getOrInsertFunction("zerofat_base",
+        builder.getInt8PtrTy(), builder.getInt8PtrTy());
+    Ptr = builder.CreateBitCast(Ptr, builder.getInt8PtrTy());
+    Value *BasePtr = builder.CreateCall(G, {Ptr});
+    return BasePtr;
+}
+
+static Constant *calcBasePtr(const TargetLibraryInfo *TLI, Function *F,
+    Constant *C, PtrInfo &baseInfo)
+{
+    //if (option_no_replace_globals)
+    //    return ConstantPointerNull::get(Type::getInt8PtrTy(C->getContext()));
+
+    ConstantExpr *CE = dyn_cast<ConstantExpr>(C);
+    if (CE == nullptr)
+        return ConstantExpr::getPointerCast(C,
+            Type::getInt8PtrTy(C->getContext()));
+
+    auto i = baseInfo.find(C);
+    if (i != baseInfo.end())
+    {
+        Constant *R = dyn_cast<Constant>(i->second);
+        assert(R != nullptr);
+        return R;
+    }
+
+    Constant *BasePtr = nullptr;
+    switch (CE->getOpcode())
+    {
+        case Instruction::GetElementPtr:
+        {
+            GEPOperator *GEP = cast<GEPOperator>(CE);
+            assert(GEP != nullptr);
+            Value *Ptr = GEP->getPointerOperand();
+            Constant *CPtr = dyn_cast<Constant>(Ptr);
+            assert(CPtr != nullptr);
+            BasePtr = calcBasePtr(TLI, F, CPtr, baseInfo);
+            break;
+        }
+        case Instruction::BitCast:
+            BasePtr = calcBasePtr(TLI, F, CE->getOperand(0), baseInfo);
+            break;
+        case Instruction::Select:
+        {
+            Constant *BasePtrA = calcBasePtr(TLI, F, CE->getOperand(1),
+                baseInfo);
+            Constant *BasePtrB = calcBasePtr(TLI, F, CE->getOperand(2),
+                baseInfo);
+            BasePtr = ConstantExpr::getSelect(CE->getOperand(0), BasePtrA,
+                BasePtrB);
+            break;
+        }
+        case Instruction::IntToPtr:
+        case Instruction::ExtractElement:
+        case Instruction::ExtractValue:
+            // Assumed to be non-fat pointers:
+            BasePtr = 
+                ConstantPointerNull::get(Type::getInt8PtrTy(CE->getContext()));
+            break;
+        default:
+        {
+            C->dump();
+            C->getContext().diagnose(ZeroFatWarning(
+                "(BUG) unknown constant expression pointer type (base)"));
+            BasePtr = 
+                ConstantPointerNull::get(Type::getInt8PtrTy(CE->getContext()));
+            break;
+        }
+    }
+
+    baseInfo.insert(std::make_pair(C, BasePtr));
+    return BasePtr;
+}
+
+static Value *calcBasePtr(const TargetLibraryInfo *TLI, Function *F,
+    Value *Ptr, PtrInfo &baseInfo)
+{
+    auto i = baseInfo.find(Ptr);
+    if (i != baseInfo.end())
+        return i->second;
+
+    errs() << "[Step 2] Calculate Base Pointer !!\n";
+
+    Value *BasePtr = ConstantPointerNull::get(Type::getInt8PtrTy(Ptr->getContext()));
+    if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(Ptr))
+        BasePtr = calcBasePtr(TLI, F, GEP->getPointerOperand(), baseInfo);
+    else if (AllocaInst *Alloca = dyn_cast<AllocaInst>(Ptr))
+    {
+        if (isInterestingAlloca(Alloca))
+        {
+            auto i = nextInsertPoint(F, Ptr);
+            IRBuilder<> builder(i.first, i.second);
+            BasePtr = builder.CreateBitCast(Ptr, builder.getInt8PtrTy());
+        }
+    }
+    else if (BitCastInst *Cast = dyn_cast<BitCastInst>(Ptr))
+        BasePtr = calcBasePtr(TLI, F, Cast->getOperand(0), baseInfo);
+    else if (SelectInst *Select = dyn_cast<SelectInst>(Ptr))
+    {
+        Value *BasePtrA = calcBasePtr(TLI, F, Select->getOperand(1),
+            baseInfo);
+        Value *BasePtrB = calcBasePtr(TLI, F, Select->getOperand(2),
+            baseInfo);
+        IRBuilder<> builder(Select);
+        BasePtr = builder.CreateSelect(Select->getOperand(0), BasePtrA,
+            BasePtrB);
+    }
+    else if (Constant *C = dyn_cast<Constant>(Ptr))
+        BasePtr = calcBasePtr(TLI, F, C, baseInfo);
+    else if (isa<IntToPtrInst>(Ptr) ||
+                isa<Argument>(Ptr) ||
+                isa<LoadInst>(Ptr) ||
+                isa<ExtractValueInst>(Ptr) ||
+                isa<ExtractElementInst>(Ptr))
+        BasePtr = calcBasePtr(F, Ptr);
+    else if (isa<CallInst>(Ptr) || isa<InvokeInst>(Ptr))
+    {
+        if (isMemoryAllocation(TLI, Ptr))
+        {
+            auto i = nextInsertPoint(F, Ptr);
+            IRBuilder<> builder(i.first, i.second);
+            BasePtr = builder.CreateBitCast(Ptr, builder.getInt8PtrTy());
+        }
+        else
+            BasePtr = calcBasePtr(F, Ptr);
+    }
+    else if (PHINode *PHI = dyn_cast<PHINode>(Ptr))
+    {
+        size_t numValues = PHI->getNumIncomingValues();
+        IRBuilder<> builder(PHI);
+        PHINode *BasePHI = builder.CreatePHI(builder.getInt8PtrTy(),
+            numValues);
+        baseInfo.insert(std::make_pair(Ptr, BasePHI));
+        for (size_t i = 0; i < numValues; i++)
+            BasePHI->addIncoming(UndefValue::get(builder.getInt8PtrTy()),
+                PHI->getIncomingBlock(i));
+        bool allNonFat = true;
+        for (size_t i = 0; i < numValues; i++)
+        {
+            Value *BasePtr = calcBasePtr(TLI, F, PHI->getIncomingValue(i),
+                baseInfo);
+            if (!isa<ConstantPointerNull>(BasePtr))
+                allNonFat = false;
+            BasePHI->setIncomingValue(i, BasePtr);
+        }
+        if (allNonFat)
+        {
+            // Cannot erase the PHI since it may exist in baseInfo.
+            baseInfo.erase(Ptr);
+            baseInfo.insert(std::make_pair(Ptr, BasePtr));
+            return BasePtr;
+        }
+        return BasePHI;
+    }
+    else
+    {
+        Ptr->dump();
+        Ptr->getContext().diagnose(ZeroFatWarning(
+                    "(BUG) unknown pointer type (base)"));
+        BasePtr =
+            ConstantPointerNull::get(Type::getInt8PtrTy(Ptr->getContext()));
+    }
+
+    baseInfo.insert(std::make_pair(Ptr, BasePtr));
+    return BasePtr;
+}
+
+static void insertBoundsCheck(const DataLayout *DL, Instruction *I, Value *Ptr,
+    unsigned info, const PtrInfo &baseInfo)
+{
+    IRBuilder<> builder(I);
+    auto i = baseInfo.find(Ptr);
+    if (i == baseInfo.end())
+    {
+        missing_baseptr_error:
+        Ptr->dump();
+        Ptr->getContext().diagnose(ZeroFatWarning(
+            "(BUG) missing base pointer"));
+        return;
+    }
+    Value *BasePtr = i->second;
+    if (BasePtr == nullptr)
+        goto missing_baseptr_error;
+    if (isa<ConstantPointerNull>(BasePtr))
+    {
+        // This is a nonfat pointer.
+        return;
+    }
+    Module *M = builder.GetInsertBlock()->getParent()->getParent();
+    size_t size = 0;
+    if (option_check_whole_access &&
+            (info == ZEROFAT_OOB_ERROR_READ || info == ZEROFAT_OOB_ERROR_WRITE))
+    {
+        Type *Ty = Ptr->getType();
+        if (auto *PtrTy = dyn_cast<PointerType>(Ty))
+        {
+            Ty = PtrTy->getPointerElementType();
+            size = DL->getTypeAllocSize(Ty)-1;
+        }
+    }
+
+    errs() << "[Step 3] Insert zerofat_oob_check !!\n";
+
+    Value *Size = builder.getInt32(size);
+    Ptr = builder.CreateBitCast(Ptr, builder.getInt8PtrTy());
+    FunctionCallee funcCallee = M->getOrInsertFunction("zerofat_oob_check",
+        builder.getVoidTy(), builder.getInt32Ty(), builder.getInt8PtrTy(),
+        builder.getInt32Ty(), builder.getInt8PtrTy());
+    Value *BoundsCheck = funcCallee.getCallee();
+    FunctionType *BoundsCheckType = funcCallee.getFunctionType();
+    builder.CreateCall(BoundsCheckType, BoundsCheck,
+        {builder.getInt32(info), Ptr, Size, BasePtr});
+}
+
+void printPlan(const std::vector<std::tuple<llvm::Instruction*, llvm::Value*, unsigned int>>& plan) {
+    int index = 0;
+    for (const auto& item : plan) {
+        std::cout << "Plan Item " << index << ":\n";
+        std::cout << "  Instruction*: " << std::get<0>(item) << "\n";
+        std::cout << "  Value*: " << std::get<1>(item) << "\n";
+        std::cout << "  unsigned int: " << std::get<2>(item) << "\n";
+        index++;
+    }
+}
+
+GlobalVariable* createOrGetZerofatSizeTable(Module* M, IRBuilder<>& builder) {
+    GlobalVariable *sizeTable = M->getGlobalVariable("zerofat_size_table");
+    if (!sizeTable) {
+        errs() << "~~~ Warning ~~~ zerofat_size_table is initializing...\n";
+
+        ArrayType *arrayType = ArrayType::get(builder.getInt32Ty(), 8);
+
+        std::vector<Constant*> initialValues = {
+            builder.getInt32(8),
+            builder.getInt32(16),
+            builder.getInt32(32),
+            builder.getInt32(64),
+            builder.getInt32(128),
+            builder.getInt32(256),
+            builder.getInt32(512),
+            builder.getInt32(1024)
+        };
+        Constant *arrayInit = ConstantArray::get(arrayType, initialValues);
+        // WeakODRLinkage, 'cause multiple definitions of zerofat_size_table... it must be same across the tables
+        sizeTable = new GlobalVariable(*M, arrayType, true, GlobalValue::WeakODRLinkage, arrayInit, "zerofat_size_table");
+    }
+    return sizeTable;
+}
+
+static void ZeroFatFunctions(Module *M, GlobalVariable *sizeTable)
+{
+    Function *F = M->getFunction("zerofat_base");
+    if (F != nullptr) {
+        errs() << "~~~ Warning ~~~ zerofat_base is initializing...\n";
+
+        FunctionType *FT = FunctionType::get(
+            Type::getInt8PtrTy(M->getContext()),
+            {Type::getInt8PtrTy(M->getContext())},
+            false
+        );
+
+        F = Function::Create(FT, Function::InternalLinkage, "zerofat_base", M);
+        BasicBlock *Entry = BasicBlock::Create(M->getContext(), "", F);
+        IRBuilder<> builder(Entry);
+
+        // Assuming the first argument is _ptr
+        Argument *Ptr = F->arg_begin();
+
+        // [Translate the C code to IR]
+        // unsigned tt_val = __builtin_arm_cmse_TT(_ptr);
+        // Note: You might need to replace the inline assembly string and constraints
+        // to match your architecture and compiler.
+        std::string AsmString = "tt $0, $1";
+        std::string Constraints = "=r,0";
+        InlineAsm *IA = InlineAsm::get(FunctionType::get(builder.getInt32Ty(), {builder.getInt32Ty()}, false), AsmString, Constraints, true);
+
+        // Assuming BasePtr is not of int32 type, cast it to int32 type.
+        Value *CastedPtr = builder.CreatePointerCast(Ptr, builder.getInt32Ty());
+
+        // Now, use CastedBasePtr as the second argument.
+        Value *tt_val = builder.CreateCall(IA, {CastedPtr});
+
+        // unsigned size_idx = tt_val & 0x000000FF;
+        Value *size_idx = builder.CreateAnd(tt_val, 255);
+
+        // unsigned size = zerofat_size_table[size_idx];
+        // Note: Replace `sizeTable` with the actual reference to your size table.
+        Value *sizePtr = builder.CreateGEP(sizeTable->getValueType(), sizeTable, {builder.getInt32(0), size_idx});
+        Value *loadedSize = builder.CreateLoad(builder.getInt32Ty(), sizePtr);
+
+        // uintptr_t ptr_val = (uintptr_t)_ptr;
+        Value *ptr_val = builder.CreatePtrToInt(Ptr, Type::getInt32Ty(builder.getContext()));
+
+        // uintptr_t base = ptr_val / size * size;
+        Value *base = builder.CreateUDiv(ptr_val, loadedSize);
+        base = builder.CreateMul(base, loadedSize);
+
+        // return (void *)base;
+        Value *ret_ptr = builder.CreateIntToPtr(base, builder.getInt8PtrTy());
+        builder.CreateRet(ret_ptr);
+
+        F->setDoesNotThrow();
+        F->setLinkage(GlobalValue::InternalLinkage);
+        F->addFnAttr(llvm::Attribute::AlwaysInline);
+    }
+
+    F = M->getFunction("zerofat_oob_check");
+    if (F != nullptr)
+    {
+        errs() << "~~~ Warning ~~~ zerofat_oob_check is initializing...\n";
+        FunctionType *FT = FunctionType::get(
+            Type::getVoidTy(M->getContext()),
+            {Type::getInt32Ty(M->getContext()),
+            Type::getInt8PtrTy(M->getContext()),
+            Type::getInt32Ty(M->getContext()),
+            Type::getInt8PtrTy(M->getContext())},
+            false
+        );
+
+        F = Function::Create(FT, Function::InternalLinkage, "zerofat_oob_check", M);
+
+        BasicBlock *Entry  = BasicBlock::Create(M->getContext(), "", F);
+        BasicBlock *Error  = BasicBlock::Create(M->getContext(), "", F);
+        BasicBlock *Return = BasicBlock::Create(M->getContext(), "", F);
+        
+        IRBuilder<> builder(Entry);
+        auto i = F->arg_begin();
+        Value *Info = &(*(i++));
+        Value *Ptr = &(*(i++));
+        Value *Size = &(*(i++));
+        Value *BasePtr = &(*(i++));
+
+        std::string AsmString = "tt $0, $1";
+        std::string Constraints = "=r,0";
+        InlineAsm *IA = InlineAsm::get(FunctionType::get(builder.getInt32Ty(), {builder.getInt32Ty()}, false), AsmString, Constraints, true);
+
+        // Assuming BasePtr is not of int32 type, cast it to int32 type.
+        Value *CastedBasePtr = builder.CreatePointerCast(BasePtr, builder.getInt32Ty());
+
+        // Now, use CastedBasePtr as the second argument.
+        Value *tt_val = builder.CreateCall(IA, {CastedBasePtr});
+
+        Value *size_idx = builder.CreateAnd(tt_val, 255);
+
+        // unsigned size = zerofat_size_table[size_idx];
+        Value *sizePtr = builder.CreateGEP(sizeTable->getValueType(), sizeTable, {builder.getInt32(0), size_idx});
+        Value *loadedSize = builder.CreateLoad(builder.getInt32Ty(), sizePtr);
+
+        // size -= size0;
+        Value *newSize = builder.CreateSub(loadedSize, Size);
+
+        // size_t diff = (size_t)((const uint8_t *)ptr - (const uint8_t *)baseptr);
+        Value *ptrInt = builder.CreatePtrToInt(Ptr, builder.getInt32Ty());
+        Value *basePtrInt = builder.CreatePtrToInt(BasePtr, builder.getInt32Ty());
+        Value *diff = builder.CreateSub(ptrInt, basePtrInt);
+
+        // if (diff >= size)
+        Value *cmp = builder.CreateICmpUGE(diff, newSize);
+        builder.CreateCondBr(cmp, Error, Return);
+
+        // Error block
+        IRBuilder<> builder2(Error);
+        FunctionCallee printfFunc = M->getOrInsertFunction("printf", builder2.getInt32Ty(), builder2.getInt8PtrTy(), builder2.getInt8PtrTy(), builder2.getInt8PtrTy());
+        Value *errorMsg = builder2.CreateGlobalStringPtr("zerofat_error: %d, ptr = %p, baseptr = %p\n");
+        builder2.CreateCall(printfFunc, {errorMsg, Ptr, BasePtr});
+
+        IRBuilder<> builder3(Return);
+        builder3.CreateRetVoid();
+
+        F->setDoesNotThrow();
+        F->setLinkage(GlobalValue::InternalLinkage);
+        F->addFnAttr(llvm::Attribute::AlwaysInline);
+    }
+}
+
+#define DEBUG_TYPE "zero-fat-inst"
+PreservedAnalyses ZeroFatInstPass::run(Module &M, ModuleAnalysisManager &AM) {
+
+    errs() << "ZeroFatInst !!" << "\n";
+    errs() << M.getName() << "======================\n";
+
+    auto &FAM = AM.getResult<llvm::FunctionAnalysisManagerModuleProxy>(M).getManager();
+    
+    const DataLayout *DL = &M.getDataLayout();
+
+    IRBuilder<> builder(M.getContext());
+    GlobalVariable* sizeTable = createOrGetZerofatSizeTable(&M, builder);
+
+    for (auto &F: M)
+    {
+        if (F.getName() == "zerofat_oob_check" || F.getName() == "zerofat_base")
+        {
+            continue;
+        }
+
+        // TLI in New Pass Manager System for LLVM 15.0.1
+        const TargetLibraryInfo &TLI = FAM.getResult<llvm::TargetLibraryAnalysis>(F);
+
+        if (F.isDeclaration())
+            continue;
+
+        Plan plan;
+        BoundsInfo boundsinfo;
+
+        // get interesting instructions such as Load, Store, ...
+        for (auto &BB: F)
+            for (auto &I: BB)
+                getInterestingInsts(&TLI, DL, boundsinfo, &I, plan);
+
+        PtrInfo baseinfo;
+        
+        printPlan(plan);
+
+        // calculate BasePtr
+        for (auto &p: plan)
+            (void)calcBasePtr(&TLI, &F, std::get<1>(p), baseinfo);
+
+        errs() << "sizeTable dump\n";
+
+        // insert Bound Check Logic
+        for (auto &p: plan)
+            insertBoundsCheck(DL, std::get<0>(p), std::get<1>(p), std::get<2>(p), baseinfo);
+    }
+
+    ZeroFatFunctions(&M, sizeTable);
+    
+    return PreservedAnalyses::none();
+}
+
+namespace
+{
+  struct ZeroFatInstLegacyPass : public ModulePass
+  {
+    static char ID;
+    ZeroFatInstLegacyPass() : ModulePass(ID){
+        initializeZeroFatInstLegacyPassPass(*PassRegistry::getPassRegistry());
+    }
+
+    bool runOnModule(Module &M) override
+    {
+      errs() << "ZeroFatInstLegacy" << "\n";
+
+      return false;
+    }
+  };
+}
+
+char ZeroFatInstLegacyPass::ID = 0;
+INITIALIZE_PASS_BEGIN(ZeroFatInstLegacyPass, "zero-fat-inst",
+                      "Zero-fat pointer instrumentation", false, false)
+INITIALIZE_PASS_END(ZeroFatInstLegacyPass, "zero-fat-inst",
+                      "Zero-fat pointer instrumentation", false, false)
+
+Pass *llvm::createZeroFatInstLegacyPass() {
+  return new ZeroFatInstLegacyPass();
+}
+
+
